@@ -13,7 +13,7 @@ use tokio_postgres::SimpleQueryMessage::Row;
 #[tokio::test]
 async fn test_replication() {
     // form SQL connection
-    let conninfo = "host=127.0.0.1 port=5433 user=postgres replication=database";
+    let conninfo = "host=127.0.0.1 port=5430 user=postgres password=postgres replication=database";
     let (client, connection) = tokio_postgres::connect(conninfo, NoTls).await.unwrap();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -147,4 +147,17 @@ async fn test_replication() {
             None => panic!("unexpected replication stream end"),
         }
     }
+
+    // Send copy done message to terminate the stream.
+    stream.copy_done().await.unwrap();
+
+    // Try to drop the slot with a new connection.
+    let (client, connection) = tokio_postgres::connect(conninfo, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+    let query = format!(r#"DROP_REPLICATION_SLOT {} WAIT;"#, slot);
+    client.simple_query(&query).await.unwrap();
 }

@@ -16,6 +16,7 @@ use crate::protocol::{LogicalReplicationMessage, ReplicationMessage};
 
 const STANDBY_STATUS_UPDATE_TAG: u8 = b'r';
 const HOT_STANDBY_FEEDBACK_TAG: u8 = b'h';
+const COPY_DONE_TAG: u8 = b'c';
 
 pin_project! {
     /// A type which deserializes the postgres replication protocol. This type can be used with
@@ -75,6 +76,17 @@ impl ReplicationStream {
         buf.put_u32(global_xmin_epoch);
         buf.put_u32(catalog_xmin);
         buf.put_u32(catalog_xmin_epoch);
+
+        this.stream.send(buf.freeze()).await
+    }
+
+    /// Sends a copy done message to signal that we want to stop replication.
+    pub async fn copy_done(self: Pin<&mut Self>) -> Result<(), Error> {
+        let mut this = self.project();
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(COPY_DONE_TAG);
+        buf.put_u32(5);
 
         this.stream.send(buf.freeze()).await
     }
@@ -149,6 +161,12 @@ impl LogicalReplicationStream {
                 catalog_xmin_epoch,
             )
             .await
+    }
+
+    /// Sends a copy done message to signal that we want to stop replication.
+    pub async fn copy_done(self: Pin<&mut Self>) -> Result<(), Error> {
+        let this = self.project();
+        this.stream.copy_done().await
     }
 }
 
