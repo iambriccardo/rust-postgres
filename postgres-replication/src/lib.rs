@@ -7,7 +7,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{ready, SinkExt, Stream};
 use pin_project_lite::pin_project;
 use postgres_types::PgLsn;
-use tokio_postgres::CopyBothDuplex;
+use tokio_postgres::{CopyBothDuplex, CopyBothMessage};
 use tokio_postgres::Error;
 
 pub mod protocol;
@@ -16,7 +16,6 @@ use crate::protocol::{LogicalReplicationMessage, ReplicationMessage};
 
 const STANDBY_STATUS_UPDATE_TAG: u8 = b'r';
 const HOT_STANDBY_FEEDBACK_TAG: u8 = b'h';
-const COPY_DONE_TAG: u8 = b'c';
 
 pin_project! {
     /// A type which deserializes the postgres replication protocol. This type can be used with
@@ -55,7 +54,7 @@ impl ReplicationStream {
         buf.put_i64(ts);
         buf.put_u8(reply);
 
-        this.stream.send(buf.freeze()).await
+        this.stream.send(CopyBothMessage::Data(buf.freeze())).await
     }
 
     /// Send hot standby feedback message to server.
@@ -77,18 +76,13 @@ impl ReplicationStream {
         buf.put_u32(catalog_xmin);
         buf.put_u32(catalog_xmin_epoch);
 
-        this.stream.send(buf.freeze()).await
+        this.stream.send(CopyBothMessage::Data(buf.freeze())).await
     }
 
     /// Sends a copy done message to signal that we want to stop replication.
     pub async fn copy_done(self: Pin<&mut Self>) -> Result<(), Error> {
         let mut this = self.project();
-
-        let mut buf = BytesMut::new();
-        buf.put_u8(COPY_DONE_TAG);
-        buf.put_u32(5);
-
-        this.stream.send(buf.freeze()).await
+        this.stream.send(CopyBothMessage::Done).await
     }
 }
 

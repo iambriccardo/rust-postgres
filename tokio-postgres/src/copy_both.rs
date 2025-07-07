@@ -7,11 +7,37 @@ use futures_util::{ready, Sink, SinkExt, Stream, StreamExt};
 use log::debug;
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::Message;
-use postgres_protocol::message::frontend;
 use postgres_protocol::message::frontend::CopyData;
 use std::marker::{PhantomData, PhantomPinned};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+/// Message type for CopyBoth operations.
+#[derive(Debug, Clone)]
+pub enum CopyBothMessage<T> {
+    /// Send data as a CopyData message
+    Data(T),
+    /// Send a CopyDone message to terminate the stream
+    Done,
+}
+
+impl<T> CopyBothMessage<T> {
+    /// Create a new data message
+    pub fn data(data: T) -> Self {
+        CopyBothMessage::Data(data)
+    }
+    
+    /// Create a new CopyDone message
+    pub fn done() -> Self {
+        CopyBothMessage::Done
+    }
+}
+
+impl<T> From<T> for CopyBothMessage<T> {
+    fn from(data: T) -> Self {
+        CopyBothMessage::Data(data)
+    }
+}
 
 /// The state machine of CopyBothReceiver
 ///
@@ -201,15 +227,11 @@ impl Stream for CopyBothReceiver {
                         Setup => Poll::Pending,
                         CopyBoth => {
                             self.state = CopyOut;
-                            let mut buf = BytesMut::new();
-                            frontend::copy_done(&mut buf);
-                            Poll::Ready(Some(FrontendMessage::Raw(buf.freeze())))
+                            Poll::Ready(Some(FrontendMessage::CopyDone))
                         }
                         CopyIn => {
                             self.state = CopyNone;
-                            let mut buf = BytesMut::new();
-                            frontend::copy_done(&mut buf);
-                            Poll::Ready(Some(FrontendMessage::Raw(buf.freeze())))
+                            Poll::Ready(Some(FrontendMessage::CopyDone))
                         }
                         _ => unreachable!(),
                     },
@@ -276,7 +298,7 @@ impl<T> Stream for CopyBothDuplex<T> {
     }
 }
 
-impl<T> Sink<T> for CopyBothDuplex<T>
+impl<T> Sink<CopyBothMessage<T>> for CopyBothDuplex<T>
 where
     T: Buf + 'static + Send,
 {
@@ -289,28 +311,48 @@ where
             .map_err(|_| Error::closed())
     }
 
-    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Error> {
-        let this = self.project();
+    fn start_send(self: Pin<&mut Self>, item: CopyBothMessage<T>) -> Result<(), Error> {
+        let mut this = self.project();
 
-        let data: Box<dyn Buf + Send> = if item.remaining() > 4096 {
-            if this.buf.is_empty() {
-                Box::new(item)
-            } else {
-                Box::new(this.buf.split().freeze().chain(item))
-            }
-        } else {
-            this.buf.put(item);
-            if this.buf.len() > 4096 {
-                Box::new(this.buf.split().freeze())
-            } else {
-                return Ok(());
-            }
-        };
+        match item {
+            CopyBothMessage::Data(data) => {
+                let data: Box<dyn Buf + Send> = if data.remaining() > 4096 {
+                    if this.buf.is_empty() {
+                        Box::new(data)
+                    } else {
+                        Box::new(this.buf.split().freeze().chain(data))
+                    }
+                } else {
+                    this.buf.put(data);
+                    if this.buf.len() > 4096 {
+                        Box::new(this.buf.split().freeze())
+                    } else {
+                        return Ok(());
+                    }
+                };
 
-        let data = CopyData::new(data).map_err(Error::encode)?;
-        this.sink_sender
-            .start_send(FrontendMessage::CopyData(data))
-            .map_err(|_| Error::closed())
+                let copy_data = CopyData::new(data).map_err(Error::encode)?;
+                this.sink_sender
+                    .start_send(FrontendMessage::CopyData(copy_data))
+                    .map_err(|_| Error::closed())
+            }
+            CopyBothMessage::Done => {
+                // Flush any buffered data first
+                if !this.buf.is_empty() {
+                    let data: Box<dyn Buf + Send> = Box::new(this.buf.split().freeze());
+                    let copy_data = CopyData::new(data).map_err(Error::encode)?;
+                    this.sink_sender
+                        .as_mut()
+                        .start_send(FrontendMessage::CopyData(copy_data))
+                        .map_err(|_| Error::closed())?;
+                }
+                
+                // Send CopyDone message
+                this.sink_sender
+                    .start_send(FrontendMessage::CopyDone)
+                    .map_err(|_| Error::closed())
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {

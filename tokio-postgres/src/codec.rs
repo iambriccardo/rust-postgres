@@ -1,13 +1,14 @@
 use bytes::{Buf, Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend;
-use postgres_protocol::message::frontend::CopyData;
+use postgres_protocol::message::frontend::{self, CopyData};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 
 pub enum FrontendMessage {
     Raw(Bytes),
     CopyData(CopyData<Box<dyn Buf + Send>>),
+    CopyDone,
 }
 
 pub enum BackendMessage {
@@ -44,6 +45,7 @@ impl Encoder<FrontendMessage> for PostgresCodec {
         match item {
             FrontendMessage::Raw(buf) => dst.extend_from_slice(&buf),
             FrontendMessage::CopyData(data) => data.write(dst),
+            FrontendMessage::CopyDone => frontend::copy_done(dst),
         }
 
         Ok(())

@@ -151,13 +151,7 @@ async fn test_replication() {
     // Send copy done message to terminate the stream.
     stream.copy_done().await.unwrap();
 
-    // Try to drop the slot with a new connection.
-    let (client, connection) = tokio_postgres::connect(conninfo, NoTls).await.unwrap();
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
+    // Try to drop the slot.
     let query = format!(r#"DROP_REPLICATION_SLOT {} WAIT;"#, slot);
     client.simple_query(&query).await.unwrap();
 }
