@@ -7,6 +7,7 @@ use futures_util::{ready, Sink, SinkExt, Stream, StreamExt};
 use log::debug;
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::Message;
+use postgres_protocol::message::frontend;
 use postgres_protocol::message::frontend::CopyData;
 use std::marker::{PhantomData, PhantomPinned};
 use std::pin::Pin;
@@ -26,7 +27,7 @@ impl<T> CopyBothMessage<T> {
     pub fn data(data: T) -> Self {
         CopyBothMessage::Data(data)
     }
-    
+
     /// Create a new CopyDone message
     pub fn done() -> Self {
         CopyBothMessage::Done
@@ -227,11 +228,15 @@ impl Stream for CopyBothReceiver {
                         Setup => Poll::Pending,
                         CopyBoth => {
                             self.state = CopyOut;
-                            Poll::Ready(Some(FrontendMessage::CopyDone))
+                            let mut buf = BytesMut::new();
+                            frontend::copy_done(&mut buf);
+                            Poll::Ready(Some(FrontendMessage::Raw(buf.freeze())))
                         }
                         CopyIn => {
                             self.state = CopyNone;
-                            Poll::Ready(Some(FrontendMessage::CopyDone))
+                            let mut buf = BytesMut::new();
+                            frontend::copy_done(&mut buf);
+                            Poll::Ready(Some(FrontendMessage::Raw(buf.freeze())))
                         }
                         _ => unreachable!(),
                     },
@@ -346,7 +351,7 @@ where
                         .start_send(FrontendMessage::CopyData(copy_data))
                         .map_err(|_| Error::closed())?;
                 }
-                
+
                 // Send CopyDone message
                 this.sink_sender
                     .start_send(FrontendMessage::CopyDone)
