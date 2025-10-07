@@ -20,6 +20,7 @@ const INSERT_TAG: u8 = b'I';
 const UPDATE_TAG: u8 = b'U';
 const DELETE_TAG: u8 = b'D';
 const TRUNCATE_TAG: u8 = b'T';
+const MESSAGE_TAG: u8 = b'M';
 const TUPLE_NEW_TAG: u8 = b'N';
 const TUPLE_KEY_TAG: u8 = b'K';
 const TUPLE_OLD_TAG: u8 = b'O';
@@ -182,6 +183,8 @@ pub enum LogicalReplicationMessage {
     Delete(DeleteBody),
     /// A TRUNCATE statement
     Truncate(TruncateBody),
+    /// A MESSAGE statement
+    Message(MessageBody),
 }
 
 impl LogicalReplicationMessage {
@@ -336,6 +339,20 @@ impl LogicalReplicationMessage {
                 }
 
                 Self::Truncate(TruncateBody { options, rel_ids })
+            }
+            MESSAGE_TAG => {
+                let flags = buf.read_i8()?;
+                let lsn = buf.read_u64::<BigEndian>()?;
+                let prefix = buf.read_cstr()?;
+                let content_len = buf.read_i32::<BigEndian>()?;
+                let content = buf.read_buf(content_len as usize)?;
+
+                Self::Message(MessageBody {
+                    flags,
+                    lsn,
+                    prefix,
+                    content,
+                })
             }
             tag => {
                 return Err(io::Error::new(
@@ -740,6 +757,38 @@ impl TruncateBody {
     /// Option bits for TRUNCATE: 1 for CASCADE, 2 for RESTART IDENTITY
     pub fn options(&self) -> i8 {
         self.options
+    }
+}
+
+/// A MESSAGE statement
+#[derive(Debug)]
+pub struct MessageBody {
+    flags: i8,
+    lsn: u64,
+    prefix: Bytes,
+    content: Bytes,
+}
+
+impl MessageBody {
+
+    #[inline]
+    pub fn flags(&self) -> i8 {
+        self.flags
+    }
+
+    #[inline]
+    pub fn lsn(&self) -> Lsn {
+        self.lsn
+    }
+
+    #[inline]
+    pub fn prefix(&self) -> io::Result<&str> {
+        get_str(&self.prefix)
+    }
+
+    #[inline]
+    pub fn content(&self) -> io::Result<&str> {
+        get_str(&self.content)
     }
 }
 
