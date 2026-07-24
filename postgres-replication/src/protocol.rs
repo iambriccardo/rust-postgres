@@ -770,23 +770,26 @@ pub struct MessageBody {
 }
 
 impl MessageBody {
-
     #[inline]
+    /// Flags; either 0 for no flags or 1 if the logical decoding message is transactional.
     pub fn flags(&self) -> i8 {
         self.flags
     }
 
     #[inline]
+    /// The LSN of the logical decoding message.
     pub fn message_lsn(&self) -> Lsn {
         self.message_lsn
     }
 
     #[inline]
+    /// The prefix of the logical decoding message.
     pub fn prefix(&self) -> io::Result<&str> {
         get_str(&self.prefix)
     }
 
     #[inline]
+    /// The content of the logical decoding message.
     pub fn content(&self) -> io::Result<&str> {
         get_str(&self.content)
     }
