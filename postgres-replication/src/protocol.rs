@@ -349,7 +349,7 @@ impl LogicalReplicationMessage {
 
                 Self::Message(MessageBody {
                     flags,
-                    lsn,
+                    message_lsn: lsn,
                     prefix,
                     content,
                 })
@@ -764,7 +764,7 @@ impl TruncateBody {
 #[derive(Debug)]
 pub struct MessageBody {
     flags: i8,
-    lsn: u64,
+    message_lsn: u64,
     prefix: Bytes,
     content: Bytes,
 }
@@ -777,8 +777,8 @@ impl MessageBody {
     }
 
     #[inline]
-    pub fn lsn(&self) -> Lsn {
-        self.lsn
+    pub fn message_lsn(&self) -> Lsn {
+        self.message_lsn
     }
 
     #[inline]
