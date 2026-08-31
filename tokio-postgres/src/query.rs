@@ -6,21 +6,20 @@ use crate::types::{BorrowToSql, IsNull};
 use crate::{Column, Error, Portal, Row, Statement};
 use bytes::{Bytes, BytesMut};
 use fallible_iterator::FallibleIterator;
-use futures_util::{ready, Stream};
-use log::{debug, log_enabled, Level};
+use futures_util::Stream;
+use log::{Level, debug, log_enabled};
 use pin_project_lite::pin_project;
 use postgres_protocol::message::backend::{CommandCompleteBody, Message};
 use postgres_protocol::message::frontend;
 use postgres_types::Type;
 use std::fmt;
-use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 struct BorrowToSqlParamsDebug<'a, T>(&'a [T]);
 
-impl<'a, T> fmt::Debug for BorrowToSqlParamsDebug<'a, T>
+impl<T> fmt::Debug for BorrowToSqlParamsDebug<'_, T>
 where
     T: BorrowToSql,
 {
@@ -57,11 +56,10 @@ where
         statement,
         responses,
         rows_affected: None,
-        _p: PhantomPinned,
     })
 }
 
-pub async fn query_typed<'a, P, I>(
+pub async fn query_typed<P, I>(
     client: &Arc<InnerClient>,
     query: &str,
     params: I,
@@ -75,7 +73,7 @@ where
         let param_oids = params.iter().map(|(_, t)| t.oid()).collect::<Vec<_>>();
 
         client.with_buf(|buf| {
-            frontend::parse("", query, param_oids.into_iter(), buf).map_err(Error::parse)?;
+            frontend::parse("", query, param_oids, buf).map_err(Error::parse)?;
             encode_bind_raw("", params, "", buf)?;
             frontend::describe(b'S', "", buf).map_err(Error::encode)?;
             frontend::execute("", 0, buf).map_err(Error::encode)?;
@@ -95,7 +93,6 @@ where
                     statement: Statement::unnamed(vec![], vec![]),
                     responses,
                     rows_affected: None,
-                    _p: PhantomPinned,
                 });
             }
             Message::RowDescription(row_description) => {
@@ -107,6 +104,7 @@ where
                         name: field.name().to_string(),
                         table_oid: Some(field.table_oid()).filter(|n| *n != 0),
                         column_id: Some(field.column_id()).filter(|n| *n != 0),
+                        type_modifier: field.type_modifier(),
                         r#type: type_,
                     };
                     columns.push(column);
@@ -115,10 +113,61 @@ where
                     statement: Statement::unnamed(vec![], columns),
                     responses,
                     rows_affected: None,
-                    _p: PhantomPinned,
                 });
             }
             _ => return Err(Error::unexpected_message()),
+        }
+    }
+}
+
+pub async fn execute_typed<P, I>(
+    client: &Arc<InnerClient>,
+    query: &str,
+    params: I,
+) -> Result<u64, Error>
+where
+    P: BorrowToSql,
+    I: IntoIterator<Item = (P, Type)>,
+{
+    let buf = {
+        let params = params.into_iter().collect::<Vec<_>>();
+        let param_oids = params.iter().map(|(_, t)| t.oid()).collect::<Vec<_>>();
+
+        client.with_buf(|buf| {
+            frontend::parse("", query, param_oids, buf).map_err(Error::parse)?;
+            encode_bind_raw("", params, "", buf)?;
+            frontend::describe(b'S', "", buf).map_err(Error::encode)?;
+            frontend::execute("", 0, buf).map_err(Error::encode)?;
+            frontend::sync(buf);
+
+            Ok(buf.split().freeze())
+        })?
+    };
+
+    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+
+    let mut rows = 0;
+
+    loop {
+        match responses.next().await? {
+            Message::ParseComplete
+            | Message::BindComplete
+            | Message::ParameterDescription(_)
+            | Message::RowDescription(_) => {}
+            Message::NoData => {
+                rows = 0;
+            }
+
+            Message::DataRow(_) => {}
+            Message::CommandComplete(body) => {
+                rows = extract_row_affected(&body)?;
+            }
+
+            Message::EmptyQueryResponse => rows = 0,
+            Message::ReadyForQuery(_) => return Ok(rows),
+            _ => {
+                return Err(Error::unexpected_message());
+            }
         }
     }
 }
@@ -140,7 +189,6 @@ pub async fn query_portal(
         statement: portal.statement().clone(),
         responses,
         rows_affected: None,
-        _p: PhantomPinned,
     })
 }
 
@@ -285,12 +333,11 @@ where
 
 pin_project! {
     /// A stream of table rows.
+    #[project(!Unpin)]
     pub struct RowStream {
         statement: Statement,
         responses: Responses,
         rows_affected: Option<u64>,
-        #[pin]
-        _p: PhantomPinned,
     }
 }
 
@@ -302,7 +349,7 @@ impl Stream for RowStream {
         loop {
             match ready!(this.responses.poll_next(cx)?) {
                 Message::DataRow(body) => {
-                    return Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)))
+                    return Poll::Ready(Some(Ok(Row::new(this.statement.clone(), body)?)));
                 }
                 Message::CommandComplete(body) => {
                     *this.rows_affected = Some(extract_row_affected(&body)?);
@@ -321,5 +368,15 @@ impl RowStream {
     /// This function will return `None` until the stream has been exhausted.
     pub fn rows_affected(&self) -> Option<u64> {
         self.rows_affected
+    }
+}
+
+pub async fn sync(client: &InnerClient) -> Result<(), Error> {
+    let buf = Bytes::from_static(b"S\0\0\0\x04");
+    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+
+    match responses.next().await? {
+        Message::ReadyForQuery(_) => Ok(()),
+        _ => Err(Error::unexpected_message()),
     }
 }

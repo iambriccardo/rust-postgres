@@ -1,20 +1,17 @@
-use crate::codec::FrontendMessage;
-use crate::connection::RequestMessages;
+#[cfg(feature = "runtime")]
+use crate::Socket;
 use crate::copy_out::CopyOutStream;
 use crate::query::RowStream;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
 use crate::types::{BorrowToSql, ToSql, Type};
-#[cfg(feature = "runtime")]
-use crate::Socket;
 use crate::{
-    bind, query, slice_iter, CancelToken, Client, CopyInSink, Error, Portal, Row,
-    SimpleQueryMessage, Statement, ToStatement,
+    CancelToken, Client, CopyInSink, Error, Portal, Row, SimpleQueryMessage, Statement,
+    ToStatement, bind, query, slice_iter,
 };
 use bytes::Buf;
 use futures_util::TryStreamExt;
-use postgres_protocol::message::frontend;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// A representation of a PostgreSQL database transaction.
@@ -33,25 +30,14 @@ struct Savepoint {
     depth: u32,
 }
 
-impl<'a> Drop for Transaction<'a> {
+impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if self.done {
             return;
         }
 
-        let query = if let Some(sp) = self.savepoint.as_ref() {
-            format!("ROLLBACK TO {}", sp.name)
-        } else {
-            "ROLLBACK".to_string()
-        };
-        let buf = self.client.inner().with_buf(|buf| {
-            frontend::query(&query, buf).unwrap();
-            buf.split().freeze()
-        });
-        let _ = self
-            .client
-            .inner()
-            .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
+        let name = self.savepoint.as_ref().map(|sp| sp.name.as_str());
+        self.client.__private_api_rollback(name);
     }
 }
 
@@ -158,6 +144,24 @@ impl<'a> Transaction<'a> {
         self.client.query_typed(statement, params).await
     }
 
+    /// Like `Client::query_typed_one`.
+    pub async fn query_typed_one(
+        &self,
+        statement: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<Row, Error> {
+        self.client.query_typed_one(statement, params).await
+    }
+
+    /// Like `Client::query_typed_opt`.
+    pub async fn query_typed_opt(
+        &self,
+        statement: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<Option<Row>, Error> {
+        self.client.query_typed_opt(statement, params).await
+    }
+
     /// Like `Client::query_typed_raw`.
     pub async fn query_typed_raw<P, I>(&self, query: &str, params: I) -> Result<RowStream, Error>
     where
@@ -177,6 +181,15 @@ impl<'a> Transaction<'a> {
         T: ?Sized + ToStatement,
     {
         self.client.execute(statement, params).await
+    }
+
+    /// Like `Client::execute_typed`.
+    pub async fn execute_typed(
+        &self,
+        statement: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<u64, Error> {
+        self.client.execute_typed(statement, params).await
     }
 
     /// Like `Client::execute_iter`.
@@ -219,7 +232,10 @@ impl<'a> Transaction<'a> {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
-        let statement = statement.__convert().into_statement(self.client).await?;
+        let statement = statement
+            .__convert()
+            .into_statement(self.client.inner())
+            .await?;
         bind::bind(self.client.inner(), statement, params).await
     }
 
@@ -314,8 +330,8 @@ impl<'a> Transaction<'a> {
 
     async fn _savepoint(&mut self, name: Option<String>) -> Result<Transaction<'_>, Error> {
         let depth = self.savepoint.as_ref().map_or(0, |sp| sp.depth) + 1;
-        let name = name.unwrap_or_else(|| format!("sp_{}", depth));
-        let query = format!("SAVEPOINT {}", name);
+        let name = name.unwrap_or_else(|| format!("sp_{depth}"));
+        let query = format!("SAVEPOINT {name}");
         self.batch_execute(&query).await?;
 
         Ok(Transaction {

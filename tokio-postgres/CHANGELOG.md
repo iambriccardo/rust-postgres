@@ -1,6 +1,96 @@
 # Change Log
 
-## Unreleased
+## v0.7.18 - 2026-06-12
+
+### Fixed
+
+* Error instead of panicking on DataRow field/column count mismatch.
+
+## v0.7.17 - 2026-03-30
+
+### Added
+
+* Added `Client::execute_typed` method.
+* Added `Client::query_typed_one` and `Client::query_typed_opt` methods.
+* Added `GenericClient::execute_typed`, `GenericClient::query_typed_one`, and `GenericClient::query_typed_opt` methods.
+* Added `Transaction::execute_typed`, `Transaction::query_typed_one`, and `Transaction::query_typed_opt` methods.
+* Added support for `bit-vec` 0.9 via the `with-bit-vec-0_9` feature.
+
+### Changed
+
+* Upgraded `rand` to 0.10.
+* Upgraded to Rust edition 2024, minimum Rust version 1.85.
+
+## v0.7.16 - 2026-01-14
+
+### Added
+
+* Added `Client::query_scalar`, `Client::query_one_scalar`, and `Client::query_opt_scalar` methods.
+* Added `Row::raw_size_bytes` method.
+* Added `Column::type_modifier` method.
+
+### Changed
+
+* Upgraded `whoami` to v2.
+
+## v0.7.15 - 2025-10-08
+
+### Added
+
+* Added `Client::check_connection` API.
+* Added `Client::simple_query_raw` API.
+
+### Changed
+
+* Improved the effectiveness of `Client::is_closed`.
+* Stop including error chain in `Display` impl of `Error`
+
+## v0.7.14 - 2025-09-25
+
+### Added
+
+* Added support for `jiff` v0.2.
+* Added support for `bit-vec` versions v0.7 and v0.8.
+* Re-exported `fallible-iterator`
+* Expose sync rollback as a private API method
+
+### Fixes
+
+* Changed `set_tcp_user_timeout` to only be called when enabled
+
+### Changed
+
+* Updated repository links to use `rust-postgres` organization.
+* Upgraded to Rust 2021 edition.
+* Upgraded `phf` to v0.13
+* Upgraded `socket2` to v0.6
+* Disabled default features of `futures-util`
+
+## v0.7.13 - 2025-02-02
+
+### Added
+
+* Added support for direct TLS negotiation.
+* Added support for `cidr` 0.3 via the `with-cidr-0_3` feature.
+
+### Fixes
+
+* Added `load_balance_hosts` to `Config`'s `Debug` implementation.
+
+### Changes
+
+* Upgraded `rand`.
+
+## v0.7.12 - 2024-09-15
+
+### Fixed
+
+* Fixed `query_typed` queries that return no rows.
+
+### Added
+
+* Added support for `jiff` 0.1 via the `with-jiff-01` feature.
+* Added support for TCP keepalive on AIX.
 
 ## v0.7.11 - 2024-07-21
 
@@ -285,4 +375,4 @@
 
 Look at the [release tags] for information about older releases.
 
-[release tags]: https://github.com/sfackler/rust-postgres/releases
+[release tags]: https://github.com/rust-postgres/rust-postgres/releases

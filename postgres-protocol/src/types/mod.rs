@@ -8,7 +8,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str;
 
-use crate::{write_nullable, FromUsize, IsNull, Lsn, Oid};
+use crate::{FromUsize, IsNull, Lsn, Oid, write_nullable};
 
 #[cfg(test)]
 mod test;
@@ -273,7 +273,10 @@ impl<'a> FallibleIterator for HstoreEntries<'a> {
         if key_len < 0 {
             return Err("invalid key length".into());
         }
-        let (key, buf) = self.buf.split_at(key_len as usize);
+        let (key, buf) = self
+            .buf
+            .split_at_checked(key_len as usize)
+            .ok_or("invalid key length")?;
         let key = str::from_utf8(key)?;
         self.buf = buf;
 
@@ -281,7 +284,10 @@ impl<'a> FallibleIterator for HstoreEntries<'a> {
         let value = if value_len < 0 {
             None
         } else {
-            let (value, buf) = self.buf.split_at(value_len as usize);
+            let (value, buf) = self
+                .buf
+                .split_at_checked(value_len as usize)
+                .ok_or("invalid value length")?;
             let value = str::from_utf8(value)?;
             self.buf = buf;
             Some(value)
@@ -324,7 +330,7 @@ pub fn varbit_from_sql(mut buf: &[u8]) -> Result<Varbit<'_>, StdBox<dyn Error + 
     if len < 0 {
         return Err("invalid varbit length: varbit < 0".into());
     }
-    let bytes = (len as usize + 7) / 8;
+    let bytes = (len as usize).div_ceil(8);
     if buf.len() != bytes {
         return Err("invalid message length: varbit mismatch".into());
     }
@@ -582,7 +588,7 @@ impl<'a> Array<'a> {
 /// An iterator over the dimensions of an array.
 pub struct ArrayDimensions<'a>(&'a [u8]);
 
-impl<'a> FallibleIterator for ArrayDimensions<'a> {
+impl FallibleIterator for ArrayDimensions<'_> {
     type Item = ArrayDimension;
     type Error = StdBox<dyn Error + Sync + Send>;
 
@@ -639,11 +645,10 @@ impl<'a> FallibleIterator for ArrayValues<'a> {
         let val = if len < 0 {
             None
         } else {
-            if self.buf.len() < len as usize {
-                return Err("invalid value length".into());
-            }
-
-            let (val, buf) = self.buf.split_at(len as usize);
+            let (val, buf) = self
+                .buf
+                .split_at_checked(len as usize)
+                .ok_or("invalid value length")?;
             self.buf = buf;
             Some(val)
         };
@@ -771,10 +776,7 @@ fn read_bound<'a>(
             None
         } else {
             let len = len as usize;
-            if buf.len() < len {
-                return Err("invalid message size".into());
-            }
-            let (value, tail) = buf.split_at(len);
+            let (value, tail) = buf.split_at_checked(len).ok_or("invalid message size")?;
             *buf = tail;
             Some(value)
         };
@@ -950,7 +952,7 @@ pub struct PathPoints<'a> {
     buf: &'a [u8],
 }
 
-impl<'a> FallibleIterator for PathPoints<'a> {
+impl FallibleIterator for PathPoints<'_> {
     type Item = Point;
     type Error = StdBox<dyn Error + Sync + Send>;
 
