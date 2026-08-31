@@ -111,7 +111,7 @@ pub struct InnerClient {
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = mpsc::channel(1024);
         let request = Request { messages, sender };
         self.sender
             .unbounded_send(request)

@@ -192,7 +192,7 @@ async fn start<T>(client: &InnerClient, buf: Bytes, simple: bool) -> Result<Copy
 where
     T: Buf + 'static + Send,
 {
-    let (mut sender, receiver) = mpsc::channel(1);
+    let (mut sender, receiver) = mpsc::channel(1024);
     let receiver = CopyInReceiver::new(receiver);
     let mut responses = client.send(RequestMessages::CopyIn(receiver))?;
 
