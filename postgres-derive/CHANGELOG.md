@@ -1,5 +1,38 @@
 # Change Log
 
+## v0.4.9 - 2026-06-12
+
+### Fixed
+
+* Error instead of panicking on duplicate composite field names.
+
+## v0.4.8 - 2026-03-30
+
+### Changed
+
+* Upgraded to Rust edition 2024, minimum Rust version 1.85.
+
+## v0.4.7 - 2025-09-25
+
+### Added
+
+* Added support for nested domains containing composite types to `FromSql`
+
+### Fixed
+
+* Added `dyn` keyword to boxed trait objects.
+
+### Changed
+
+* Updated repository links to use `rust-postgres` organization.
+* Upgraded to Rust 2021 edition.
+
+## v0.4.6 - 2024-09-15
+
+### Changed
+
+* Upgraded `heck`.
+
 ## v0.4.5 - 2023-08-19
 
 ### Added

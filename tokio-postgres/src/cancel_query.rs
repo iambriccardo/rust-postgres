@@ -1,12 +1,13 @@
 use crate::client::SocketConfig;
-use crate::config::SslMode;
+use crate::config::{SslMode, SslNegotiation};
 use crate::tls::MakeTlsConnect;
-use crate::{cancel_query_raw, connect_socket, Error, Socket};
+use crate::{Error, Socket, cancel_query_raw, connect_socket};
 use std::io;
 
 pub(crate) async fn cancel_query<T>(
     config: Option<SocketConfig>,
     ssl_mode: SslMode,
+    ssl_negotiation: SslNegotiation,
     mut tls: T,
     process_id: i32,
     secret_key: i32,
@@ -20,7 +21,7 @@ where
             return Err(Error::connect(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown host",
-            )))
+            )));
         }
     };
 
@@ -38,6 +39,14 @@ where
     )
     .await?;
 
-    cancel_query_raw::cancel_query_raw(socket, ssl_mode, tls, has_hostname, process_id, secret_key)
-        .await
+    cancel_query_raw::cancel_query_raw(
+        socket,
+        ssl_mode,
+        ssl_negotiation,
+        tls,
+        has_hostname,
+        process_id,
+        secret_key,
+    )
+    .await
 }

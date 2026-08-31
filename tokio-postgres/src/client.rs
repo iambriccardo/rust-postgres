@@ -1,5 +1,7 @@
+#[cfg(feature = "runtime")]
+use crate::Socket;
 use crate::codec::{BackendMessages, FrontendMessage};
-use crate::config::SslMode;
+use crate::config::{SslMode, SslNegotiation};
 use crate::connection::{Request, RequestMessages};
 use crate::copy_both::{CopyBothDuplex, CopyBothReceiver};
 use crate::copy_out::CopyOutStream;
@@ -11,29 +13,28 @@ use crate::simple_query::SimpleQueryStream;
 use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
 use crate::types::{Oid, ToSql, Type};
-#[cfg(feature = "runtime")]
-use crate::Socket;
 use crate::{
-    copy_both, copy_in, copy_out, prepare, query, simple_query, slice_iter, CancelToken,
-    CopyInSink, Error, Row, SimpleQueryMessage, Statement, ToStatement, Transaction,
-    TransactionBuilder,
+    CancelToken, CopyInSink, Error, Row, SimpleQueryMessage, Statement, ToStatement, Transaction,
+    TransactionBuilder, copy_both, copy_in, copy_out, prepare, query, simple_query, slice_iter,
 };
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
 use futures_channel::mpsc;
-use futures_util::{future, pin_mut, ready, Stream, StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use postgres_protocol::message::backend::Message;
-use postgres_types::BorrowToSql;
+use postgres_protocol::message::frontend;
+use postgres_types::{BorrowToSql, FromSqlOwned};
 use std::collections::HashMap;
 use std::fmt;
+use std::future;
 #[cfg(feature = "runtime")]
 use std::net::IpAddr;
 #[cfg(feature = "runtime")]
 use std::path::PathBuf;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 #[cfg(feature = "runtime")]
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -110,7 +111,7 @@ pub struct InnerClient {
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = mpsc::channel(1024);
         let request = Request { messages, sender };
         self.sender
             .unbounded_send(request)
@@ -225,6 +226,7 @@ pub struct Client {
     #[cfg(feature = "runtime")]
     socket_config: Option<SocketConfig>,
     ssl_mode: SslMode,
+    ssl_negotiation: SslNegotiation,
     process_id: i32,
     secret_key: i32,
 }
@@ -233,6 +235,7 @@ impl Client {
     pub(crate) fn new(
         sender: mpsc::UnboundedSender<Request>,
         ssl_mode: SslMode,
+        ssl_negotiation: SslNegotiation,
         process_id: i32,
         secret_key: i32,
     ) -> Client {
@@ -245,6 +248,7 @@ impl Client {
             #[cfg(feature = "runtime")]
             socket_config: None,
             ssl_mode,
+            ssl_negotiation,
             process_id,
             secret_key,
         }
@@ -301,6 +305,30 @@ impl Client {
             .await
     }
 
+    /// Returns a vector of scalars.
+    pub async fn query_scalar<R: FromSqlOwned, T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<R>, Error>
+    where
+        T: ?Sized + ToStatement + fmt::Debug,
+    {
+        let rows: Vec<Row> = self
+            .query_raw(statement, slice_iter(params))
+            .await?
+            .try_collect()
+            .await?;
+
+        if let Some(row) = rows.first() {
+            if row.len() != 1 {
+                return Err(Error::column_count());
+            }
+        };
+
+        rows.into_iter().map(|r| r.try_get(0)).collect()
+    }
+
     /// Executes a statement which returns a single row, returning it.
     ///
     /// Returns an error if the query does not return exactly one row.
@@ -324,6 +352,24 @@ impl Client {
             .and_then(|res| res.ok_or_else(Error::row_count))
     }
 
+    /// Like [`Client::query_one`] but returns one scalar.
+    pub async fn query_one_scalar<R: FromSqlOwned, T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<R, Error>
+    where
+        T: ?Sized + ToStatement + fmt::Debug,
+    {
+        let row = self.query_one(statement, params).await?;
+
+        if row.len() != 1 {
+            return Err(Error::column_count());
+        }
+
+        row.try_get(0)
+    }
+
     /// Executes a statements which returns zero or one rows, returning it.
     ///
     /// Returns an error if the query returns more than one row.
@@ -342,8 +388,7 @@ impl Client {
     where
         T: ?Sized + ToStatement,
     {
-        let stream = self.query_raw(statement, slice_iter(params)).await?;
-        pin_mut!(stream);
+        let mut stream = pin!(self.query_raw(statement, slice_iter(params)).await?);
 
         let mut first = None;
 
@@ -363,6 +408,26 @@ impl Client {
         Ok(first)
     }
 
+    /// Like [`Client::query_opt`] but returns an optional scalar.
+    pub async fn query_opt_scalar<R: FromSqlOwned, T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<R>, Error>
+    where
+        T: ?Sized + ToStatement + fmt::Debug,
+    {
+        let row = self.query_opt(statement, params).await?;
+
+        if let Some(row) = &row {
+            if row.len() != 1 {
+                return Err(Error::column_count());
+            }
+        }
+
+        row.map(|x| x.try_get::<_, R>(0)).transpose()
+    }
+
     /// The maximally flexible version of [`query`].
     ///
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
@@ -378,18 +443,18 @@ impl Client {
     ///
     /// ```no_run
     /// # async fn async_main(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    /// use futures_util::{pin_mut, TryStreamExt};
+    /// use std::pin::pin;
+    /// use futures_util::TryStreamExt;
     ///
     /// let params: Vec<String> = vec![
     ///     "first param".into(),
     ///     "second param".into(),
     /// ];
-    /// let mut it = client.query_raw(
+    /// let mut it = pin!(client.query_raw(
     ///     "SELECT foo FROM bar WHERE biz = $1 AND baz = $2",
     ///     params,
-    /// ).await?;
+    /// ).await?);
     ///
-    /// pin_mut!(it);
     /// while let Some(row) = it.try_next().await? {
     ///     let foo: i32 = row.get("foo");
     ///     println!("foo: {}", foo);
@@ -404,7 +469,7 @@ impl Client {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
-        let statement = statement.__convert().into_statement(self).await?;
+        let statement = statement.__convert().into_statement(&self.inner).await?;
         query::query(&self.inner, statement, params).await
     }
 
@@ -428,6 +493,70 @@ impl Client {
             .await
     }
 
+    /// Like `query_one`, but requires the types of query parameters to be explicitly specified.
+    ///
+    /// Compared to `query_one`, this method allows performing queries without three round trips (for
+    /// prepare, execute, and close) by requiring the caller to specify parameter values along with
+    /// their Postgres type. Thus, this is suitable in environments where prepared statements aren't
+    /// supported (such as Cloudflare Workers with Hyperdrive).
+    ///
+    /// Executes a statement which returns a single row, returning it.
+    ///
+    /// Returns an error if the query does not return exactly one row.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    pub async fn query_typed_one(
+        &self,
+        statement: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<Row, Error> {
+        self.query_typed_opt(statement, params)
+            .await
+            .and_then(|res| res.ok_or_else(Error::row_count))
+    }
+
+    /// Like `query_one`, but requires the types of query parameters to be explicitly specified.
+    ///
+    /// Compared to `query_one`, this method allows performing queries without three round trips (for
+    /// prepare, execute, and close) by requiring the caller to specify parameter values along with
+    /// their Postgres type. Thus, this is suitable in environments where prepared statements aren't
+    /// supported (such as Cloudflare Workers with Hyperdrive).
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the
+    /// parameter of the list provided, 1-indexed.
+    /// Executes a statements which returns zero or one rows, returning it.
+    ///
+    /// Returns an error if the query returns more than one row.
+    pub async fn query_typed_opt(
+        &self,
+        statement: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<Option<Row>, Error> {
+        let mut stream = pin!(
+            self.query_typed_raw(statement, params.iter().map(|(v, t)| (*v, t.clone())))
+                .await?
+        );
+
+        let mut first = None;
+
+        // Originally this was two calls to `try_next().await?`,
+        // once for the first element, and second to error if more than one.
+        //
+        // However, this new form with only one .await in a loop generates
+        // slightly smaller codegen/stack usage for the resulting future.
+        while let Some(row) = stream.try_next().await? {
+            if first.is_some() {
+                return Err(Error::row_count());
+            }
+
+            first = Some(row);
+        }
+
+        Ok(first)
+    }
+
     /// The maximally flexible version of [`query_typed`].
     ///
     /// Compared to `query`, this method allows performing queries without three round trips (for
@@ -444,19 +573,19 @@ impl Client {
     ///
     /// ```no_run
     /// # async fn async_main(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    /// use futures_util::{pin_mut, TryStreamExt};
+    /// use std::pin::pin;
+    /// use futures_util::{TryStreamExt};
     /// use tokio_postgres::types::Type;
     ///
     /// let params: Vec<(String, Type)> = vec![
     ///     ("first param".into(), Type::TEXT),
     ///     ("second param".into(), Type::TEXT),
     /// ];
-    /// let mut it = client.query_typed_raw(
+    /// let mut it = pin!(client.query_typed_raw(
     ///     "SELECT foo FROM bar WHERE biz = $1 AND baz = $2",
     ///     params,
-    /// ).await?;
+    /// ).await?);
     ///
-    /// pin_mut!(it);
     /// while let Some(row) = it.try_next().await? {
     ///     let foo: i32 = row.get("foo");
     ///     println!("foo: {}", foo);
@@ -493,6 +622,29 @@ impl Client {
         self.execute_raw(statement, slice_iter(params)).await
     }
 
+    /// Executes a statement, returning the number of rows modified.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `statement` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// If the statement does not modify any rows (e.g. `SELECT`), 0 is returned.
+    pub async fn execute_typed(
+        &self,
+        statement: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<u64, Error> {
+        query::execute_typed(
+            &self.inner,
+            statement,
+            params.iter().map(|(v, t)| (*v, t.clone())),
+        )
+        .await
+    }
+
     /// The maximally flexible version of [`execute`].
     ///
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
@@ -510,7 +662,7 @@ impl Client {
         I: IntoIterator<Item = P>,
         I::IntoIter: ExactSizeIterator,
     {
-        let statement = statement.__convert().into_statement(self).await?;
+        let statement = statement.__convert().into_statement(&self.inner).await?;
         query::execute(self.inner(), statement, params).await
     }
 
@@ -523,7 +675,7 @@ impl Client {
         T: ?Sized + ToStatement,
         U: Buf + 'static + Send,
     {
-        let statement = statement.__convert().into_statement(self).await?;
+        let statement = statement.__convert().into_statement(&self.inner).await?;
         copy_in::copy_in(self.inner(), statement).await
     }
 
@@ -542,7 +694,7 @@ impl Client {
     where
         T: ?Sized + ToStatement,
     {
-        let statement = statement.__convert().into_statement(self).await?;
+        let statement = statement.__convert().into_statement(&self.inner).await?;
         copy_out::copy_out(self.inner(), statement).await
     }
 
@@ -577,7 +729,20 @@ impl Client {
         self.simple_query_raw(query).await?.try_collect().await
     }
 
-    pub(crate) async fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
+    /// Executes a sequence of SQL statements using the simple query protocol, returning the resulting rows as a stream.
+    ///
+    /// Statements should be separated by semicolons. If an error occurs, execution of the sequence will stop at that
+    /// point. The simple query protocol returns the values in rows as strings rather than in their binary encodings,
+    /// so the associated row type doesn't work with the `FromSql` trait. Rather than simply returning a list of the
+    /// rows, this method returns a list of an enum which indicates either the completion of one of the commands,
+    /// or a row of data. This preserves the framing between the separate statements in the request.
+    ///
+    /// # Warning
+    ///
+    /// Prepared statements should be use for any query which contains user-specified data, as they provided the
+    /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
+    /// them to this method!
+    pub async fn simple_query_raw(&self, query: &str) -> Result<SimpleQueryStream, Error> {
         simple_query::simple_query(self.inner(), query).await
     }
 
@@ -593,6 +758,12 @@ impl Client {
     /// them to this method!
     pub async fn batch_execute(&self, query: &str) -> Result<(), Error> {
         simple_query::batch_execute(self.inner(), query).await
+    }
+
+    /// Check that the connection is alive and wait for the confirmation.
+    pub async fn check_connection(&self) -> Result<(), Error> {
+        // sync is a very quick message to test the connection health.
+        query::sync(self.inner()).await
     }
 
     /// Begins a new database transaction.
@@ -622,6 +793,7 @@ impl Client {
             #[cfg(feature = "runtime")]
             socket_config: self.socket_config.clone(),
             ssl_mode: self.ssl_mode,
+            ssl_negotiation: self.ssl_negotiation,
             process_id: self.process_id,
             secret_key: self.secret_key,
         }
@@ -667,6 +839,21 @@ impl Client {
     /// In that case, all future queries will fail.
     pub fn is_closed(&self) -> bool {
         self.inner.sender.is_closed()
+    }
+
+    #[doc(hidden)]
+    pub fn __private_api_rollback(&self, name: Option<&str>) {
+        let buf = self.inner().with_buf(|buf| {
+            if let Some(name) = name {
+                frontend::query(&format!("ROLLBACK TO {}", name), buf).unwrap();
+            } else {
+                frontend::query("ROLLBACK", buf).unwrap();
+            }
+            buf.split().freeze()
+        });
+        let _ = self
+            .inner()
+            .send(RequestMessages::Single(FrontendMessage::Raw(buf)));
     }
 
     #[doc(hidden)]

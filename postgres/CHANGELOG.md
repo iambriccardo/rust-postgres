@@ -1,5 +1,61 @@
 # Change Log
 
+## v0.19.14 - 2026-06-12
+
+### Changed
+
+* Updated `tokio-postgres` to v0.7.18.
+
+## v0.19.13 - 2026-03-30
+
+### Added
+
+* Added `Client::execute_typed` method.
+* Added `Client::query_typed_one` and `Client::query_typed_opt` methods.
+* Added `GenericClient::execute_typed`, `GenericClient::query_typed_one`, and `GenericClient::query_typed_opt` methods.
+* Added `Transaction::execute_typed`, `Transaction::query_typed_one`, and `Transaction::query_typed_opt` methods.
+* Added support for `bit-vec` 0.9 via the `with-bit-vec-0_9` feature.
+
+### Changed
+
+* Upgraded to Rust edition 2024, minimum Rust version 1.85.
+
+## v0.19.12 - 2025-10-08
+
+### Added
+
+* Added `Client::check_connection` API.
+
+### Changed
+
+* Improved the effectiveness of `Client::is_closed`.
+* Disabled default features of `futures-util`.
+
+## v0.19.11 - 2025-09-25
+
+### Added
+
+* Added support for `jiff` v0.2.
+* Added support for `bit-vec` versions v0.7 and v0.8.
+
+### Changed
+
+* Updated repository links to use `rust-postgres` organization.
+* Upgraded to Rust 2021 edition.
+
+## v0.19.10 - 2025-02-02
+
+### Added
+
+* Added support for direct TLS negotiation.
+* Added support for `cidr` 0.3 via the `with-cidr-0_3` feature.
+
+## v0.19.9 - 2024-09-15
+
+### Added
+
+* Added support for `jiff` 0.1 via the `with-jiff-01` feature.
+
 ## v0.19.8 - 2024-07-21
 
 ### Added
@@ -268,4 +324,4 @@
 
 Look at the [release tags] for information about older releases.
 
-[release tags]: https://github.com/sfackler/rust-postgres/releases
+[release tags]: https://github.com/rust-postgres/rust-postgres/releases

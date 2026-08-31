@@ -1,10 +1,10 @@
 //! SASL-based authentication support.
 
+use base64::Engine;
 use base64::display::Base64Display;
 use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use hmac::{Hmac, Mac};
-use rand::{self, Rng};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::{self, RngExt};
 use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -14,6 +14,16 @@ use std::mem;
 use std::str;
 
 const NONCE_LENGTH: usize = 24;
+
+/// The maximum SCRAM iteration count the client will accept from the server.
+///
+/// The iteration count is sent by the server and drives a PBKDF2 loop, so an
+/// unbounded value lets a malicious or impersonating server force the client to
+/// perform an arbitrary number of HMAC operations before authentication even
+/// completes (a denial of service). 100_000 is ~24x the PostgreSQL default of
+/// 4096 and matches the default cap the PostgreSQL JDBC driver (pgjdbc) adopted
+/// for the same issue (CVE-2026-42198).
+const MAX_ITERATION_COUNT: u32 = 100_000;
 
 /// The identifier of the SCRAM-SHA-256 SASL authentication mechanism.
 pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
@@ -136,10 +146,10 @@ impl ScramSha256 {
     /// Constructs a new instance which will use the provided password for authentication.
     pub fn new(password: &[u8], channel_binding: ChannelBinding) -> ScramSha256 {
         // rand 0.5's ThreadRng is cryptographically secure
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let nonce = (0..NONCE_LENGTH)
             .map(|_| {
-                let mut v = rng.gen_range(0x21u8..0x7e);
+                let mut v = rng.random_range(0x21u8..0x7e);
                 if v == 0x2c {
                     v = 0x7e
                 }
@@ -180,7 +190,7 @@ impl ScramSha256 {
                     password,
                     channel_binding,
                 } => (nonce, password, channel_binding),
-                _ => return Err(io::Error::new(io::ErrorKind::Other, "invalid SCRAM state")),
+                _ => return Err(io::Error::other("invalid SCRAM state")),
             };
 
         let message =
@@ -190,6 +200,13 @@ impl ScramSha256 {
 
         if !parsed.nonce.starts_with(&client_nonce) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid nonce"));
+        }
+
+        if parsed.iteration_count > MAX_ITERATION_COUNT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SCRAM iteration count exceeds the maximum allowed",
+            ));
         }
 
         let salt = match STANDARD.decode(parsed.salt) {
@@ -205,7 +222,7 @@ impl ScramSha256 {
         let client_key = hmac.finalize().into_bytes();
 
         let mut hash = Sha256::default();
-        hash.update(client_key.as_slice());
+        hash.update(client_key);
         let stored_key = hash.finalize_fixed();
 
         let mut cbind_input = vec![];
@@ -252,7 +269,7 @@ impl ScramSha256 {
                 salted_password,
                 auth_message,
             } => (salted_password, auth_message),
-            _ => return Err(io::Error::new(io::ErrorKind::Other, "invalid SCRAM state")),
+            _ => return Err(io::Error::other("invalid SCRAM state")),
         };
 
         let message =
@@ -262,10 +279,7 @@ impl ScramSha256 {
 
         let verifier = match parsed {
             ServerFinalMessage::Error(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SCRAM error: {}", e),
-                ));
+                return Err(io::Error::other(format!("SCRAM error: {e}")));
             }
             ServerFinalMessage::Verifier(verifier) => verifier,
         };
@@ -305,10 +319,8 @@ impl<'a> Parser<'a> {
         match self.it.next() {
             Some((_, c)) if c == target => Ok(()),
             Some((i, c)) => {
-                let m = format!(
-                    "unexpected character at byte {}: expected `{}` but got `{}",
-                    i, target, c
-                );
+                let m =
+                    format!("unexpected character at byte {i}: expected `{target}` but got `{c}");
                 Err(io::Error::new(io::ErrorKind::InvalidInput, m))
             }
             None => Err(io::Error::new(
@@ -374,7 +386,7 @@ impl<'a> Parser<'a> {
         match self.it.peek() {
             Some(&(i, _)) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unexpected trailing data at byte {}", i),
+                format!("unexpected trailing data at byte {i}"),
             )),
             None => Ok(()),
         }
@@ -396,7 +408,7 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> io::Result<&'a str> {
-        self.take_while(|c| matches!(c, '\0' | '=' | ','))
+        self.take_while(|c| !matches!(c, '\0' | '=' | ','))
     }
 
     fn server_error(&mut self) -> io::Result<Option<&'a str>> {
@@ -450,6 +462,20 @@ mod test {
         assert_eq!(message.iteration_count, 4096);
     }
 
+    #[test]
+    fn parse_server_error_message() {
+        let message = "e=invalid-proof";
+        match Parser::new(message).server_final_message().unwrap() {
+            ServerFinalMessage::Error(error) => assert_eq!(error, "invalid-proof"),
+            ServerFinalMessage::Verifier(_) => panic!("expected server error"),
+        }
+
+        // the error value ends at the first '\0', '=' or ','
+        for message in ["invalid-proof\0x", "invalid-proof=x", "invalid-proof,x"] {
+            assert_eq!(Parser::new(message).value().unwrap(), "invalid-proof");
+        }
+    }
+
     // recorded auth exchange from psql
     #[test]
     fn exchange() {
@@ -457,11 +483,9 @@ mod test {
         let nonce = "9IZ2O01zb9IgiIZ1WJ/zgpJB";
 
         let client_first = "n,,n=,r=9IZ2O01zb9IgiIZ1WJ/zgpJB";
-        let server_first =
-            "r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,s=fs3IXBy7U7+IvVjZ,i\
+        let server_first = "r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,s=fs3IXBy7U7+IvVjZ,i\
              =4096";
-        let client_final =
-            "c=biws,r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,p=AmNKosjJzS3\
+        let client_final = "c=biws,r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,p=AmNKosjJzS3\
              1NTlQYNs5BTeQjdHdk7lOflDo5re2an8=";
         let server_final = "v=U+ppxD5XUKtradnv8e2MkeupiA8FU87Sg8CXzXHDAzw=";
 
@@ -476,5 +500,18 @@ mod test {
         assert_eq!(str::from_utf8(scram.message()).unwrap(), client_final);
 
         scram.finish(server_final.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn excessive_iteration_count_is_rejected() {
+        // a malicious server cannot force an unbounded PBKDF2 loop; the iteration
+        // count is rejected before `hi()` runs.
+        let nonce = "9IZ2O01zb9IgiIZ1WJ/zgpJB";
+        let server_first =
+            "r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,s=fs3IXBy7U7+IvVjZ,i=1000000";
+
+        let mut scram =
+            ScramSha256::new_inner(b"foobar", ChannelBinding::unsupported(), nonce.to_string());
+        assert!(scram.update(server_first.as_bytes()).is_err());
     }
 }

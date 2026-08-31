@@ -2,12 +2,11 @@
 
 use bytes::{Bytes, BytesMut};
 use futures_channel::mpsc;
-use futures_util::{
-    future, join, pin_mut, stream, try_join, Future, FutureExt, SinkExt, StreamExt, TryStreamExt,
-};
+use futures_util::{FutureExt, SinkExt, StreamExt, TryStreamExt, join, stream, try_join};
 use pin_project_lite::pin_project;
 use std::fmt::Write;
-use std::pin::Pin;
+use std::future::{self, Future};
+use std::pin::{Pin, pin};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -149,6 +148,12 @@ async fn scram_password_ok() {
 }
 
 #[tokio::test]
+async fn sync() {
+    let client = connect("user=postgres").await;
+    client.check_connection().await.unwrap();
+}
+
+#[tokio::test]
 async fn pipelined_prepare() {
     let client = connect("user=postgres").await;
 
@@ -162,6 +167,30 @@ async fn pipelined_prepare() {
 
     assert_eq!(statement2.params()[0], Type::INT8);
     assert_eq!(statement2.columns()[0].type_(), &Type::INT8);
+}
+
+#[tokio::test]
+async fn prepare_type_modifier() {
+    let client = connect("user=postgres").await;
+
+    let statement = client
+        .prepare("SELECT $1::BIGINT, $2::VARCHAR(7), $3::VARCHAR(101)")
+        .await
+        .unwrap();
+
+    let varlena_header_length = 4;
+    assert_eq!(statement.columns()[0].type_(), &Type::INT8);
+    assert_eq!(statement.columns()[0].type_modifier(), -1);
+    assert_eq!(statement.columns()[1].type_(), &Type::VARCHAR);
+    assert_eq!(
+        statement.columns()[1].type_modifier(),
+        7 + varlena_header_length
+    );
+    assert_eq!(statement.columns()[2].type_(), &Type::VARCHAR);
+    assert_eq!(
+        statement.columns()[2].type_modifier(),
+        101 + varlena_header_length
+    );
 }
 
 #[tokio::test]
@@ -406,6 +435,71 @@ async fn transaction_commit() {
 }
 
 #[tokio::test]
+async fn execute_typed() {
+    let client = connect("user=postgres").await;
+
+    client
+        .batch_execute(
+            "
+                CREATE TEMPORARY TABLE foo (
+                    name TEXT,
+                    age INT
+                );
+                INSERT INTO foo (name, age) VALUES ('alice', 20), ('bob', 30), ('carol', 40);
+            ",
+        )
+        .await
+        .unwrap();
+
+    // one row is modified, hence expect 1
+    let n = client
+        .execute_typed(
+            "INSERT INTO foo (name, age) VALUES ($1, $2)",
+            &[(&"dave", Type::TEXT), (&39i32, Type::INT4)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(n, 1);
+
+    // confirming execution succeeded
+    let row = client
+        .query_typed_one(
+            "SELECT age FROM foo WHERE name = $1",
+            &[(&"dave", Type::TEXT)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i32>(0), 39);
+
+    // there are 4 rows in the table, that will be updated
+    let n = client
+        .execute_typed("UPDATE foo SET age = $1", &[(&100i32, Type::INT4)])
+        .await
+        .unwrap();
+
+    assert_eq!(n, 4);
+    // no rows are modified, hence expect 0
+    let n = client
+        .execute_typed("SELECT * FROM foo WHERE age < $1", &[(&50i32, Type::INT4)])
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+
+    // there are 4 rows in the table, that will be updated
+    let n = client
+        .execute_typed(
+            "UPDATE foo SET age = $1 RETURNING name",
+            &[(&200i32, Type::INT4)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(n, 4);
+}
+
+#[tokio::test]
 async fn transaction_rollback() {
     let mut client = connect("user=postgres").await;
 
@@ -590,8 +684,7 @@ async fn copy_in() {
         .into_iter()
         .map(Ok::<_, Error>),
     );
-    let sink = client.copy_in("COPY foo FROM STDIN").await.unwrap();
-    pin_mut!(sink);
+    let mut sink = pin!(client.copy_in("COPY foo FROM STDIN").await.unwrap());
     sink.send_all(&mut stream).await.unwrap();
     let rows = sink.finish().await.unwrap();
     assert_eq!(rows, 2);
@@ -625,11 +718,11 @@ async fn copy_in_large() {
     let a = Bytes::from_static(b"0\tname0\n");
     let mut b = BytesMut::new();
     for i in 1..5_000 {
-        writeln!(b, "{0}\tname{0}", i).unwrap();
+        writeln!(b, "{i}\tname{i}").unwrap();
     }
     let mut c = BytesMut::new();
     for i in 5_000..10_000 {
-        writeln!(c, "{0}\tname{0}", i).unwrap();
+        writeln!(c, "{i}\tname{i}").unwrap();
     }
     let mut stream = stream::iter(
         vec![a, b.freeze(), c.freeze()]
@@ -637,8 +730,7 @@ async fn copy_in_large() {
             .map(Ok::<_, Error>),
     );
 
-    let sink = client.copy_in("COPY foo FROM STDIN").await.unwrap();
-    pin_mut!(sink);
+    let mut sink = pin!(client.copy_in("COPY foo FROM STDIN").await.unwrap());
     sink.send_all(&mut stream).await.unwrap();
     let rows = sink.finish().await.unwrap();
     assert_eq!(rows, 10_000);
@@ -659,8 +751,7 @@ async fn copy_in_error() {
         .unwrap();
 
     {
-        let sink = client.copy_in("COPY foo FROM STDIN").await.unwrap();
-        pin_mut!(sink);
+        let mut sink = pin!(client.copy_in("COPY foo FROM STDIN").await.unwrap());
         sink.send(Bytes::from_static(b"1\tsteven")).await.unwrap();
     }
 
@@ -705,7 +796,7 @@ async fn copy_out() {
 async fn notices() {
     let long_name = "x".repeat(65);
     let (client, mut connection) =
-        connect_raw(&format!("user=postgres application_name={}", long_name,))
+        connect_raw(&format!("user=postgres application_name={long_name}",))
             .await
             .unwrap();
 
@@ -903,6 +994,63 @@ async fn query_one() {
 }
 
 #[tokio::test]
+async fn query_typed_one() {
+    let client = connect("user=postgres").await;
+
+    client
+        .batch_execute(
+            "
+                CREATE TEMPORARY TABLE foo (
+                    name TEXT,
+                    age INT
+                );
+                INSERT INTO foo (name, age) VALUES ('alice', 20), ('bob', 30), ('carol', 40);
+            ",
+        )
+        .await
+        .unwrap();
+
+    // should return exactly one row
+    let row = client
+        .query_typed_one(
+            "SELECT name, age FROM foo WHERE name = $1 AND age = $2",
+            &[(&"alice", Type::TEXT), (&20i32, Type::INT4)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, &str>(0), "alice");
+    assert_eq!(row.get::<_, i32>(1), 20);
+
+    // dave doesn't exist, hence should return no row
+    client
+        .query_typed_one(
+            "SELECT * FROM foo WHERE name = $1",
+            &[(&"dave", Type::TEXT)],
+        )
+        .await
+        .err()
+        .unwrap();
+
+    // should return error if the number of rows returned is not exactly one
+    client
+        .query_typed_one("SELECT * FROM foo", &[])
+        .await
+        .err()
+        .unwrap();
+
+    // should be none because no row is returned
+    client
+        .query_typed_one(
+            "INSERT INTO foo (name, age) VALUES ($1, $2)",
+            &[(&"dave", Type::TEXT), (&45i32, Type::INT4)],
+        )
+        .await
+        .err()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn query_opt() {
     let client = connect("user=postgres").await;
 
@@ -918,21 +1066,85 @@ async fn query_opt() {
         .await
         .unwrap();
 
-    assert!(client
-        .query_opt("SELECT * FROM foo WHERE name = 'dave'", &[])
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        client
+            .query_opt("SELECT * FROM foo WHERE name = 'dave'", &[])
+            .await
+            .unwrap()
+            .is_none()
+    );
     client
         .query_opt("SELECT * FROM foo WHERE name = 'alice'", &[])
         .await
         .unwrap()
         .unwrap();
     client
-        .query_one("SELECT * FROM foo", &[])
+        .query_opt("SELECT * FROM foo", &[])
         .await
         .err()
         .unwrap();
+}
+
+#[tokio::test]
+async fn query_typed_opt() {
+    let client = connect("user=postgres").await;
+
+    client
+        .batch_execute(
+            "
+                CREATE TEMPORARY TABLE foo (
+                    name TEXT,
+                    age INT
+                );
+                INSERT INTO foo (name, age) VALUES ('alice', 20), ('bob', 30), ('carol', 40);
+            ",
+        )
+        .await
+        .unwrap();
+
+    // should return exactly one row
+    let row = client
+        .query_typed_opt(
+            "SELECT name, age FROM foo WHERE name = $1 AND age = $2",
+            &[(&"alice", Type::TEXT), (&20i32, Type::INT4)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.get::<_, &str>(0), "alice");
+    assert_eq!(row.get::<_, i32>(1), 20);
+
+    // dave doesn't exist, hence should return no row
+    assert!(
+        client
+            .query_typed_opt(
+                "SELECT * FROM foo WHERE name = $1",
+                &[(&"dave", Type::TEXT)]
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // should return error if the number of rows returned is not exactly one or zero
+    client
+        .query_typed_opt("SELECT * FROM foo", &[])
+        .await
+        .err()
+        .unwrap();
+
+    // should be none because no row is returned
+    assert!(
+        client
+            .query_typed_opt(
+                "INSERT INTO foo (name, age) VALUES ($1, $2)",
+                &[(&"dave", Type::TEXT), (&45i32, Type::INT4)],
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1079,4 +1291,73 @@ async fn query_typed_with_transaction() {
         .await
         .unwrap();
     assert_eq!(updated_rows.len(), 0);
+}
+
+#[tokio::test]
+async fn query_scalar() {
+    let client = connect("user=postgres").await;
+    client
+        .batch_execute(
+            "
+            CREATE TEMPORARY TABLE person (
+                id serial,
+                name text NOT NULL,
+                age integer
+            );
+            INSERT INTO person (name, age) VALUES ('steven', 18);
+            INSERT INTO person (name, age) VALUES ('fred', 20);
+            INSERT INTO person (name, age) VALUES ('john', NULL);
+            ",
+        )
+        .await
+        .unwrap();
+
+    let ages: Vec<i32> = client
+        .query_scalar(
+            "SELECT age FROM person WHERE name = ANY($1)",
+            &[&vec!["steven", "fred"]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ages, vec![18, 20]);
+
+    let error: Error = client
+        .query_scalar::<Vec<i32>, _>("SELECT name, age FROM person", &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("query returned an unexpected number of columns")
+    );
+
+    let ages: Vec<Option<i32>> = client
+        .query_scalar("SELECT age FROM person", &[])
+        .await
+        .unwrap();
+    assert_eq!(ages, vec![Some(18), Some(20), None]);
+
+    let age: i32 = client
+        .query_one_scalar("SELECT age FROM person WHERE name = $1", &[&"steven"])
+        .await
+        .unwrap();
+    assert_eq!(age, 18);
+
+    let age: Option<i32> = client
+        .query_one_scalar("SELECT age FROM person WHERE name = $1", &[&"john"])
+        .await
+        .unwrap();
+    assert_eq!(age, None);
+
+    let age: Option<i32> = client
+        .query_opt_scalar("SELECT age FROM person WHERE name = $1", &[&"bill"])
+        .await
+        .unwrap();
+    assert_eq!(age, None);
+
+    let age: Option<i32> = client
+        .query_opt_scalar("SELECT age FROM person WHERE name = $1", &[&"fred"])
+        .await
+        .unwrap();
+    assert_eq!(age, Some(20));
 }

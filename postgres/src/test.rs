@@ -3,9 +3,9 @@ use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use tokio_postgres::NoTls;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
-use tokio_postgres::NoTls;
 
 use super::*;
 use crate::binary_copy::{BinaryCopyInWriter, BinaryCopyOutIter};
@@ -507,4 +507,25 @@ fn check_send() {
     is_send::<Client>();
     is_send::<Statement>();
     is_send::<Transaction<'_>>();
+}
+
+#[test]
+fn is_closed() {
+    let mut client = Client::connect("host=localhost port=5433 user=postgres", NoTls).unwrap();
+    assert!(!client.is_closed());
+    client.check_connection().unwrap();
+
+    let row = client.query_one("select pg_backend_pid()", &[]).unwrap();
+    let pid: i32 = row.get(0);
+
+    {
+        let mut client2 = Client::connect("host=localhost port=5433 user=postgres", NoTls).unwrap();
+        client2
+            .query("SELECT pg_terminate_backend($1)", &[&pid])
+            .unwrap();
+    }
+
+    assert!(!client.is_closed());
+    client.check_connection().unwrap_err();
+    assert!(client.is_closed());
 }
