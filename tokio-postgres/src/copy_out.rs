@@ -10,6 +10,10 @@ use postgres_protocol::message::backend::Message;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+// A COPY response can contain an arbitrarily large row. Keep only one response
+// buffer queued so downstream polling provides byte-oriented backpressure.
+const RESPONSE_CHANNEL_CAPACITY: usize = 1;
+
 pub async fn copy_out_simple(client: &InnerClient, query: &str) -> Result<CopyOutStream, Error> {
     debug!("executing copy out query {}", query);
 
@@ -27,7 +31,10 @@ pub async fn copy_out(client: &InnerClient, statement: Statement) -> Result<Copy
 }
 
 async fn start(client: &InnerClient, buf: Bytes, simple: bool) -> Result<Responses, Error> {
-    let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
+    let mut responses = client.send_with_capacity(
+        RequestMessages::Single(FrontendMessage::Raw(buf)),
+        RESPONSE_CHANNEL_CAPACITY,
+    )?;
 
     if !simple {
         match responses.next().await? {
