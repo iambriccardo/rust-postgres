@@ -111,7 +111,15 @@ pub struct InnerClient {
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
-        let (sender, receiver) = mpsc::channel(1024);
+        self.send_with_capacity(messages, 1024)
+    }
+
+    pub(crate) fn send_with_capacity(
+        &self,
+        messages: RequestMessages,
+        capacity: usize,
+    ) -> Result<Responses, Error> {
+        let (sender, receiver) = mpsc::channel(capacity);
         let request = Request { messages, sender };
         self.sender
             .unbounded_send(request)
